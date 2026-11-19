@@ -186,9 +186,33 @@ def make_candidates(words, heat, duration):
     return out[:6]
 
 
-MODEL_FALLBACKS = ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.7-flash",
-                   "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
+MODEL_FALLBACKS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]
 _GOOD_MODEL = None
+_DISCOVERED = None
+GEM_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def discover_models():
+    """Ask Google which Flash models this key can really use (cached)."""
+    global _DISCOVERED
+    if _DISCOVERED is not None:
+        return _DISCOVERED
+    _DISCOVERED = []
+    try:
+        r = requests.get(f"{GEM_BASE}/models", params={"key": GEMINI_KEY, "pageSize": 200}, timeout=30)
+        r.raise_for_status()
+        names = []
+        for m in r.json().get("models", []):
+            n = m.get("name", "").replace("models/", "")
+            if ("flash" in n and "generateContent" in m.get("supportedGenerationMethods", [])
+                    and not any(x in n for x in ("image", "tts", "live", "audio", "embedding", "robotics"))):
+                names.append(n)
+        names.sort(key=lambda n: ("lite" in n, "preview" in n or "exp" in n, n))
+        _DISCOVERED = names
+        log("  [llm] models your key can use:", ", ".join(names[:8]) or "(none)")
+    except Exception as ex:
+        log("  [llm] could not list models:", str(ex)[:150])
+    return _DISCOVERED
 
 
 def llm_score(video, cands):
@@ -209,29 +233,44 @@ def llm_score(video, cands):
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3}}
     global _GOOD_MODEL
-    first = CFG.get("gemini_model")
-    models = [_GOOD_MODEL] if _GOOD_MODEL else ([first] if first else []) + [
-        m for m in MODEL_FALLBACKS if m != first]
+    if _GOOD_MODEL:
+        models = [_GOOD_MODEL]
+    else:
+        first = CFG.get("gemini_model")
+        models = []
+        for m in ([first] if first else []) + MODEL_FALLBACKS + discover_models():
+            if m and m not in models:
+                models.append(m)
+        models = models[:6]
     for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        for attempt in range(2):
+        url = f"{GEM_BASE}/models/{model}:generateContent"
+        for attempt in range(3):
             try:
-                r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=90)
-                if r.status_code == 404:
-                    log(f"  [llm] model '{model}' not available, trying next")
+                r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=45)
+                if r.status_code in (404, 400):
+                    log(f"  [llm] model '{model}' rejected ({r.status_code}): {r.text[:150].strip()}")
                     break
-                if r.status_code == 429 and attempt == 0:
-                    time.sleep(25)
+                if r.status_code in (401, 403):
+                    log(f"  [llm] key problem ({r.status_code}): {r.text[:200].strip()}")
+                    return None
+                if r.status_code in (429, 500, 502, 503, 504):
+                    log(f"  [llm] '{model}' busy ({r.status_code}), attempt {attempt + 1}/3")
+                    time.sleep(8 * (attempt + 1))
                     continue
                 r.raise_for_status()
                 txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
                 data = json.loads(txt)
+                if isinstance(data, dict):
+                    data = [data]
                 _GOOD_MODEL = model
+                log(f"  [llm] using model '{model}'")
                 return [d for d in data if isinstance(d, dict)]
+            except requests.exceptions.Timeout:
+                log(f"  [llm] '{model}' timed out, attempt {attempt + 1}/3")
             except Exception as ex:
-                log("  [llm] failed:", ex)
-                return None
-    log("  [llm] no Gemini model worked")
+                log(f"  [llm] '{model}' error: {str(ex)[:150]}")
+                break
+    log("  [llm] no Gemini model worked for this video")
     return None
 
 
