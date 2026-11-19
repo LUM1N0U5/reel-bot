@@ -73,7 +73,9 @@ def find_videos():
 
 # ============================ 2. analyse video (before any rendering) ============================
 def ydl_opts(**extra):
-    o = {"quiet": True, "no_warnings": True}
+    o = {"quiet": True, "no_warnings": True,
+         "js_runtimes": {"node": {}, "deno": {}},
+         "remote_components": ["ejs:github"]}
     if COOKIES:
         o["cookiefile"] = str(COOKIES)
     o.update(extra)
@@ -98,7 +100,7 @@ def fetch_info(vid):
     from yt_dlp import YoutubeDL
     for f in WORK.glob(f"{vid}.*.json3"):
         f.unlink()
-    opts = ydl_opts(skip_download=True, writesubtitles=True, writeautomaticsub=True,
+    opts = ydl_opts(skip_download=True, ignore_no_formats_error=True, writesubtitles=True, writeautomaticsub=True,
                     subtitleslangs=[CFG["language"]], subtitlesformat="json3",
                     outtmpl={"default": str(WORK / "%(id)s.%(ext)s")})
     with YoutubeDL(opts) as y:
@@ -329,7 +331,8 @@ def run(cmd, **kw):
 def download_section(vid, s, e, out):
     out = Path(out)
     out.unlink(missing_ok=True)
-    cmd = [sys.executable, "-m", "yt_dlp", "-q", "-f", "bv*[height<=1080]+ba/b[height<=1080]",
+    cmd = [sys.executable, "-m", "yt_dlp", "-q", "--js-runtimes", "node", "--remote-components", "ejs:github",
+           "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
            "--merge-output-format", "mp4", "--download-sections", f"*{s:.2f}-{e:.2f}",
            "--force-keyframes-at-cuts", "-o", str(out), f"https://www.youtube.com/watch?v={vid}"]
     if COOKIES:
