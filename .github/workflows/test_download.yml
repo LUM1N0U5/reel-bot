@@ -1,0 +1,24 @@
+name: Test YouTube download
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: pip install -r requirements.txt
+      - name: Self-test
+        env:
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: python reel_bot.py --selftest
