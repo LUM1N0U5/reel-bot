@@ -55,7 +55,7 @@ def find_videos():
     import datetime as dt
     if not YT_API_KEY:
         raise SystemExit("YT_API_KEY is not set")
-    after = (dt.datetime.utcnow() - dt.timedelta(days=CFG["days_back"])).strftime("%Y-%m-%dT%H:%M:%SZ")
+    after = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=CFG["days_back"])).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = requests.get("https://www.googleapis.com/youtube/v3/search", timeout=30, params=dict(
         part="snippet", q=CFG["topic"], type="video", order="viewCount", publishedAfter=after,
         maxResults=15, key=YT_API_KEY, videoDuration=CFG["video_duration"],
@@ -103,6 +103,10 @@ def fetch_info(vid):
                     outtmpl={"default": str(WORK / "%(id)s.%(ext)s")})
     with YoutubeDL(opts) as y:
         info = y.extract_info(f"https://www.youtube.com/watch?v={vid}", download=True)
+    lang = (info.get("language") or "").lower()
+    if lang and not lang.startswith(CFG["language"].lower()):
+        log(f"  [lang] video language is '{lang}', not '{CFG['language']}' - skipping")
+        return info.get("duration") or 0, [], []
     files = list(WORK.glob(f"{vid}.*.json3"))
     words = parse_words(files[0]) if files else []
     return info.get("duration") or 0, info.get("heatmap") or [], words
@@ -182,6 +186,11 @@ def make_candidates(words, heat, duration):
     return out[:6]
 
 
+MODEL_FALLBACKS = ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.7-flash",
+                   "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
+_GOOD_MODEL = None
+
+
 def llm_score(video, cands):
     """One Gemini call scoring all candidates. Returns list of dicts or None."""
     if not GEMINI_KEY:
@@ -197,22 +206,33 @@ def llm_score(video, cands):
         "honest, no hashtags) and 'hashtags' (5 relevant hashtags starting with #).\n"
         'Return ONLY a JSON array like [{"id":0,"hook":0,"self_contained":0,"payoff":0,"retention":0,'
         '"title":"","hashtags":["#a"]}].\nCandidates: ' + json.dumps(items))
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{CFG['gemini_model']}:generateContent"
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3}}
-    for attempt in range(2):
-        try:
-            r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=90)
-            if r.status_code == 429 and attempt == 0:
-                time.sleep(25)
-                continue
-            r.raise_for_status()
-            txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            data = json.loads(txt)
-            return [d for d in data if isinstance(d, dict)]
-        except Exception as ex:
-            log("  [llm] failed:", ex)
-            return None
+    global _GOOD_MODEL
+    first = CFG.get("gemini_model")
+    models = [_GOOD_MODEL] if _GOOD_MODEL else ([first] if first else []) + [
+        m for m in MODEL_FALLBACKS if m != first]
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in range(2):
+            try:
+                r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=90)
+                if r.status_code == 404:
+                    log(f"  [llm] model '{model}' not available, trying next")
+                    break
+                if r.status_code == 429 and attempt == 0:
+                    time.sleep(25)
+                    continue
+                r.raise_for_status()
+                txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                data = json.loads(txt)
+                _GOOD_MODEL = model
+                return [d for d in data if isinstance(d, dict)]
+            except Exception as ex:
+                log("  [llm] failed:", ex)
+                return None
+    log("  [llm] no Gemini model worked")
+    return None
 
 
 def final_score(c, llm, has_heat):
@@ -221,7 +241,8 @@ def final_score(c, llm, has_heat):
         l = (0.35 * llm.get("hook", 0) + 0.25 * llm.get("self_contained", 0) +
              0.20 * llm.get("payoff", 0) + 0.20 * llm.get("retention", 0)) * 10
         return 0.45 * l + 0.35 * heat + 0.20 * pace if has_heat else 0.70 * l + 0.30 * pace
-    return 0.6 * heat + 0.4 * pace if has_heat else 0.8 * pace
+    # No AI rating available: be stricter, so unscored clips rarely pass the threshold
+    return (0.6 * heat + 0.4 * pace) * 0.8 if has_heat else 0.5 * pace
 
 
 def choose_clip(state):
@@ -279,14 +300,20 @@ def download_section(vid, s, e, out):
 
 
 def transcribe(path):
+    """Returns (words, detected_language). Audio is decoded with ffmpeg, not PyAV."""
+    import numpy as np
     from faster_whisper import WhisperModel
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-ac", "1",
+                          "-ar", "16000", "-f", "f32le", "-"],
+                         check=True, capture_output=True).stdout
+    audio = np.frombuffer(raw, dtype=np.float32)
     model = WhisperModel("base", compute_type="int8")
-    segs, _ = model.transcribe(str(path), word_timestamps=True)
+    segs, info = model.transcribe(audio, word_timestamps=True)
     words = []
     for s in segs:
         for w in s.words or []:
             words.append({"w": w.word.strip(), "t": w.start, "e": w.end})
-    return [w for w in words if w["w"]]
+    return [w for w in words if w["w"]], info.language
 
 
 def ts(t):
@@ -369,7 +396,10 @@ def run_once(dry):
     v = clip["video"]
     log(f"[chosen] {v['title']} | {clip['s']:.1f}-{clip['e']:.1f}s | score {clip['score']:.0f}")
     src = download_section(v["id"], clip["s"], clip["e"], WORK / "source.mp4")
-    words = transcribe(src)
+    words, spoken = transcribe(src)
+    if spoken != CFG["language"]:
+        log(f"[skip] clip is spoken in '{spoken}', not '{CFG['language']}'. Skipping this cycle.")
+        return
     if words:
         make_ass(words, WORK / "subs.ass")
     reel = render_reel("source.mp4", bool(words))

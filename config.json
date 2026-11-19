@@ -7,7 +7,7 @@
   "min_score": 65,
   "min_clip": 30,
   "max_clip": 60,
-  "gemini_model": "gemini-2.5-flash",
+  "gemini_model": "gemini-flash-latest",
   "font": "Montserrat",
   "extra_hashtags": ["#viral", "#reels", "#fyp"]
 }
