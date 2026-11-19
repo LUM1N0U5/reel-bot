@@ -219,11 +219,22 @@ def discover_models():
     return _DISCOVERED
 
 
+def _retry_delay(text, default=40):
+    """Google sometimes says how long to wait ("retryDelay": "34s"). Cap it so runs stay short."""
+    m = re.search(r'retryDelay"?\s*:\s*"?(\d+(?:\.\d+)?)s', text)
+    secs = float(m.group(1)) + 2 if m else default
+    return min(max(secs, 15), 70)
+
+
 def llm_score(video, cands):
-    """One Gemini call scoring all candidates. Returns list of dicts or None."""
+    """One gentle Gemini call scoring up to 3 candidates. Returns list of dicts or None."""
+    global _GOOD_MODEL, _FAILS
     if not GEMINI_KEY:
         return None
-    items = [{"id": i, "text": c["text"][:2000]} for i, c in enumerate(cands)]
+    if _FAILS >= 2:
+        log("  [llm] Gemini failed twice already this run - not hammering it any more")
+        return None
+    items = [{"id": i, "text": c["text"][:1200]} for i, c in enumerate(cands)]
     prompt = (
         "You are a short-form video editor judging which excerpt of a YouTube video would perform "
         "best as a Facebook/Instagram Reel. Each candidate is a 30-60 second transcript (auto-captions, "
@@ -236,8 +247,7 @@ def llm_score(video, cands):
         '"title":"","hashtags":["#a"]}].\nCandidates: ' + json.dumps(items))
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3}}
-    global _GOOD_MODEL, _FAILS
-    if _GOOD_MODEL:
+    if _GOOD_MODEL and _GOOD_MODEL not in _DEAD:
         models = [_GOOD_MODEL]
     else:
         first = CFG.get("gemini_model")
@@ -245,13 +255,12 @@ def llm_score(video, cands):
         for m in ([first] if first else []) + MODEL_FALLBACKS + discover_models():
             if m and m not in models and m not in _DEAD:
                 models.append(m)
-        models = models[:4]
-    tries = 3 if _FAILS < 2 else 1
+        models = models[:3]          # each model has its own free quota, but don't try dozens
     for model in models:
         url = f"{GEM_BASE}/models/{model}:generateContent"
         cur = json.loads(json.dumps(body))
         cur["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}   # faster answers
-        for attempt in range(tries):
+        for attempt in range(2):                                                # first try + ONE retry
             try:
                 r = requests.post(url, params={"key": GEMINI_KEY}, json=cur, timeout=75)
                 if r.status_code == 400 and "thinkingConfig" in cur["generationConfig"]:
@@ -263,11 +272,24 @@ def llm_score(video, cands):
                     break
                 if r.status_code in (401, 403):
                     log(f"  [llm] key problem ({r.status_code}): {r.text[:200].strip()}")
+                    _FAILS = 99
                     return None
-                if r.status_code in (429, 500, 502, 503, 504):
-                    log(f"  [llm] '{model}' busy ({r.status_code}), attempt {attempt + 1}/{tries}")
-                    if attempt < tries - 1:
-                        time.sleep(10 * (attempt + 1))
+                if r.status_code == 429:
+                    snippet = " ".join(r.text.split())[:260]
+                    log(f"  [llm] '{model}' rate-limited (429): {snippet}")
+                    if re.search(r"per ?day|PerDay", r.text, re.I):
+                        log(f"  [llm] daily free quota used up for '{model}' - moving on")
+                        _DEAD.add(model)
+                        break
+                    if attempt == 0:
+                        wait = _retry_delay(r.text)
+                        log(f"  [llm] waiting {wait:.0f}s for the per-minute limit to reset")
+                        time.sleep(wait)
+                    continue
+                if r.status_code in (500, 502, 503, 504):
+                    log(f"  [llm] '{model}' busy ({r.status_code}), attempt {attempt + 1}/2")
+                    if attempt == 0:
+                        time.sleep(15)
                     continue
                 r.raise_for_status()
                 txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
@@ -279,7 +301,7 @@ def llm_score(video, cands):
                 log(f"  [llm] using model '{model}'")
                 return [d for d in data if isinstance(d, dict)]
             except requests.exceptions.Timeout:
-                log(f"  [llm] '{model}' timed out, attempt {attempt + 1}/{tries}")
+                log(f"  [llm] '{model}' timed out, attempt {attempt + 1}/2")
             except Exception as ex:
                 log(f"  [llm] '{model}' error: {str(ex)[:150]}")
                 break
@@ -299,7 +321,8 @@ def final_score(c, llm, has_heat):
 
 
 def choose_clip(state):
-    best, evaluated = None, 0
+    # Phase 1: read captions + build candidate clips for several videos. No Gemini yet (cheap).
+    pool, evaluated = [], 0
     for v in find_videos():
         if evaluated >= CFG["videos_to_evaluate"]:
             break
@@ -318,17 +341,34 @@ def choose_clip(state):
         if not cands:
             log(f"[skip] {v['title'][:50]}: no fresh candidate windows")
             continue
-        llm = llm_score(v, cands) or []
-        for i, c in enumerate(cands):
-            c["llm"] = next((x for x in llm if x.get("id") == i), None)
-            c["score"] = final_score(c, c["llm"], bool(heat))
+        for c in cands:
+            c["llm"] = None
             c["video"] = v
-        top = max(cands, key=lambda c: c["score"])
+            c["score"] = final_score(c, None, bool(heat))
+        pool.append((v, cands, bool(heat)))
+        log(f"[prepared] {v['title'][:50]} -> {len(cands)} candidate clips")
+    if not pool:
+        log("No usable videos this cycle. Skipping.")
+        return None
+
+    # Phase 2: ask Gemini about only the best few videos, with long pauses between calls.
+    pool.sort(key=lambda p: max(c["score"] for c in p[1]), reverse=True)
+    n_rate = CFG.get("videos_to_rate", 2)
+    pause = CFG.get("gemini_pause_seconds", 25)
+    best = None
+    for n, (v, cands, has_heat) in enumerate(pool[:n_rate]):
+        if n:
+            time.sleep(pause)
+        top3 = cands[:3]
+        llm = llm_score(v, top3) or []
+        for i, c in enumerate(top3):
+            c["llm"] = next((x for x in llm if x.get("id") == i), None)
+            c["score"] = final_score(c, c["llm"], has_heat)
+        top = max(top3, key=lambda c: c["score"])
         log(f"[scored] {v['title'][:50]} -> best {top['score']:.0f} "
             f"({top['s']:.0f}-{top['e']:.0f}s, heat={top['heat']:.2f}, pace={top['pace']:.0f})")
         if best is None or top["score"] > best["score"]:
             best = top
-        time.sleep(4)   # stay inside free-tier rate limits
     if best and best["score"] >= CFG["min_score"]:
         return best
     log(f"No clip reached the minimum score of {CFG['min_score']}. Skipping this cycle.")
