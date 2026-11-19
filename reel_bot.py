@@ -188,9 +188,11 @@ def make_candidates(words, heat, duration):
     return out[:6]
 
 
-MODEL_FALLBACKS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]
+MODEL_FALLBACKS = ["gemini-flash-latest"]
 _GOOD_MODEL = None
 _DISCOVERED = None
+_DEAD = set()      # models Google says are gone: never retry them
+_FAILS = 0         # videos where every model failed (then we stop hammering Google)
 GEM_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
@@ -221,7 +223,7 @@ def llm_score(video, cands):
     """One Gemini call scoring all candidates. Returns list of dicts or None."""
     if not GEMINI_KEY:
         return None
-    items = [{"id": i, "text": c["text"][:3000]} for i, c in enumerate(cands)]
+    items = [{"id": i, "text": c["text"][:2000]} for i, c in enumerate(cands)]
     prompt = (
         "You are a short-form video editor judging which excerpt of a YouTube video would perform "
         "best as a Facebook/Instagram Reel. Each candidate is a 30-60 second transcript (auto-captions, "
@@ -234,30 +236,38 @@ def llm_score(video, cands):
         '"title":"","hashtags":["#a"]}].\nCandidates: ' + json.dumps(items))
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3}}
-    global _GOOD_MODEL
+    global _GOOD_MODEL, _FAILS
     if _GOOD_MODEL:
         models = [_GOOD_MODEL]
     else:
         first = CFG.get("gemini_model")
         models = []
         for m in ([first] if first else []) + MODEL_FALLBACKS + discover_models():
-            if m and m not in models:
+            if m and m not in models and m not in _DEAD:
                 models.append(m)
-        models = models[:6]
+        models = models[:4]
+    tries = 3 if _FAILS < 2 else 1
     for model in models:
         url = f"{GEM_BASE}/models/{model}:generateContent"
-        for attempt in range(3):
+        cur = json.loads(json.dumps(body))
+        cur["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}   # faster answers
+        for attempt in range(tries):
             try:
-                r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=45)
+                r = requests.post(url, params={"key": GEMINI_KEY}, json=cur, timeout=75)
+                if r.status_code == 400 and "thinkingConfig" in cur["generationConfig"]:
+                    cur["generationConfig"].pop("thinkingConfig")   # this model dislikes the setting
+                    r = requests.post(url, params={"key": GEMINI_KEY}, json=cur, timeout=75)
                 if r.status_code in (404, 400):
                     log(f"  [llm] model '{model}' rejected ({r.status_code}): {r.text[:150].strip()}")
+                    _DEAD.add(model)
                     break
                 if r.status_code in (401, 403):
                     log(f"  [llm] key problem ({r.status_code}): {r.text[:200].strip()}")
                     return None
                 if r.status_code in (429, 500, 502, 503, 504):
-                    log(f"  [llm] '{model}' busy ({r.status_code}), attempt {attempt + 1}/3")
-                    time.sleep(8 * (attempt + 1))
+                    log(f"  [llm] '{model}' busy ({r.status_code}), attempt {attempt + 1}/{tries}")
+                    if attempt < tries - 1:
+                        time.sleep(10 * (attempt + 1))
                     continue
                 r.raise_for_status()
                 txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
@@ -265,13 +275,15 @@ def llm_score(video, cands):
                 if isinstance(data, dict):
                     data = [data]
                 _GOOD_MODEL = model
+                _FAILS = 0
                 log(f"  [llm] using model '{model}'")
                 return [d for d in data if isinstance(d, dict)]
             except requests.exceptions.Timeout:
-                log(f"  [llm] '{model}' timed out, attempt {attempt + 1}/3")
+                log(f"  [llm] '{model}' timed out, attempt {attempt + 1}/{tries}")
             except Exception as ex:
                 log(f"  [llm] '{model}' error: {str(ex)[:150]}")
                 break
+    _FAILS += 1
     log("  [llm] no Gemini model worked for this video")
     return None
 
