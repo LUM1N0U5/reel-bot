@@ -51,11 +51,11 @@ def overlaps(s, e, used):
 
 
 # ============================ 1. find videos ============================
-def find_videos():
+def find_videos(days):
     import datetime as dt
     if not YT_API_KEY:
         raise SystemExit("YT_API_KEY is not set")
-    after = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=CFG["days_back"])).strftime("%Y-%m-%dT%H:%M:%SZ")
+    after = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = requests.get("https://www.googleapis.com/youtube/v3/search", timeout=30, params=dict(
         part="snippet", q=CFG["topic"], type="video", order="viewCount", publishedAfter=after,
         maxResults=15, key=YT_API_KEY, videoDuration=CFG["video_duration"],
@@ -320,29 +320,11 @@ def _try_model(model, body):
     return "busy", None
 
 
-def llm_score(video, cands):
-    """Gemini call scoring up to 3 candidates. Persistent: many models, retries, one cool-down round."""
+def _ask(body):
+    """Send one request to Gemini with all the retry/model-fallback logic. Returns list of dicts or None."""
     global _GOOD_MODEL, _FAILS
     if not GEMINI_KEY or _FAILS >= 99 or not _budget_left():
         return None
-    items = [{"id": i, "text": c["text"][:1200]} for i, c in enumerate(cands)]
-    prompt = (
-        "You are a short-form video editor judging which excerpt of a YouTube video would perform "
-        "best as a Facebook/Instagram Reel. Each candidate is a 30-60 second transcript (auto-captions, "
-        "no punctuation). Video title: " + video["title"] + ". Channel: " + video.get("channel", "") +
-        ". Description start: " + video.get("desc", "").replace("\n", " ") + "\n"
-        "Also give 'gameplay' (0-10): how sure you are that this excerpt shows ACTUAL in-game video-game "
-        "footage being played (player actions, missions, driving, shooting inside the game). Give 0-3 if it "
-        "is real-world footage, news, a reaction, a trailer breakdown, an interview, or just talking.\n"
-        "For each candidate give integer scores 0-10: hook (do the first 3 seconds grab attention), "
-        "self_contained (makes sense without the rest of the video), payoff (clear punchline/insight/reveal), "
-        "retention (keeps viewers watching to the end). Also write 'title' (max 80 chars, curiosity-driven, "
-        "honest, no hashtags) and 'hashtags' (5 relevant hashtags starting with #).\n"
-        'Return ONLY a JSON array like [{"id":0,"hook":0,"self_contained":0,"payoff":0,"retention":0,"gameplay":0,'
-        '"title":"","hashtags":["#a"]}].\nCandidates: ' + json.dumps(items))
-    body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3}}
-
     for round_no in range(2):                      # round 2 happens after a cool-down
         models = []
         first = CFG.get("gemini_model")
@@ -372,6 +354,31 @@ def llm_score(video, cands):
     return None
 
 
+def llm_score(video, cands):
+    """Gemini call scoring up to 3 candidates. Persistent: many models, retries, one cool-down round."""
+    global _GOOD_MODEL, _FAILS
+    if not GEMINI_KEY or _FAILS >= 99 or not _budget_left():
+        return None
+    items = [{"id": i, "text": c["text"][:1200]} for i, c in enumerate(cands)]
+    prompt = (
+        "You are a short-form video editor judging which excerpt of a YouTube video would perform "
+        "best as a Facebook/Instagram Reel. Each candidate is a 30-60 second transcript (auto-captions, "
+        "no punctuation). Video title: " + video["title"] + ". Channel: " + video.get("channel", "") +
+        ". Description start: " + video.get("desc", "").replace("\n", " ") + "\n"
+        "Also give 'gameplay' (0-10): how sure you are that this excerpt shows ACTUAL in-game video-game "
+        "footage being played (player actions, missions, driving, shooting inside the game). Give 0-3 if it "
+        "is real-world footage, news, a reaction, a trailer breakdown, an interview, or just talking.\n"
+        "For each candidate give integer scores 0-10: hook (do the first 3 seconds grab attention), "
+        "self_contained (makes sense without the rest of the video), payoff (clear punchline/insight/reveal), "
+        "retention (keeps viewers watching to the end). Also write 'title' (max 80 chars, curiosity-driven, "
+        "honest, no hashtags) and 'hashtags' (5 relevant hashtags starting with #).\n"
+        'Return ONLY a JSON array like [{"id":0,"hook":0,"self_contained":0,"payoff":0,"retention":0,"gameplay":0,'
+        '"title":"","hashtags":["#a"]}].\nCandidates: ' + json.dumps(items))
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3}}
+    return _ask(body)
+
+
 def final_score(c, llm, has_heat):
     heat, pace = c["heat"] * 100, c["pace"]
     if llm:
@@ -384,21 +391,43 @@ def final_score(c, llm, has_heat):
     return (0.6 * heat + 0.4 * pace) * 0.8 if has_heat else 0.5 * pace
 
 
-def choose_clip(state):
-    # Phase 1: read captions + build candidate clips for several videos. No Gemini yet (cheap).
+def _blocked_word(v):
+    """Titles/descriptions that announce real-life or non-gameplay content."""
+    words = CFG.get("block_words", ["real life", "irl", "vlog", "reaction", "unboxing"])
+    text = (v["title"] + " " + v.get("desc", "")).lower()
+    for w in words:
+        if re.search(r"(?<!\w)" + re.escape(w.lower()) + r"(?!\w)", text):
+            return w
+    return None
+
+
+def _choose_in_window(state, days, seen):
+    """Returns a list of good clips (best first) from the most viewed videos of the last `days` days."""
+    global GEM_DEADLINE
+    rejected = set(state.get("__rejected__", []))
     pool, evaluated, tried = [], 0, 0
-    for v in find_videos():
+    for v in find_videos(days):
+        if v["id"] in seen:
+            continue
         if evaluated >= CFG["videos_to_evaluate"]:
             break
         want_cat = str(CFG.get("only_category", "") or "")
         if want_cat and v.get("cat") != want_cat:
             log(f"[skip] {v['title'][:50]}: not in YouTube category {want_cat} (Gaming is 20)")
             continue
+        bw = _blocked_word(v)
+        if bw:
+            log(f"[skip] {v['title'][:50]}: title/description says '{bw}'")
+            continue
+        if v["id"] in rejected:
+            log(f"[skip] {v['title'][:50]}: earlier visual check said it is not gameplay")
+            continue
         if tried >= 10:
             break
         if tried:
             time.sleep(3)        # be gentle with YouTube
         tried += 1
+        seen.add(v["id"])
         try:
             duration, heat, words = fetch_info(v["id"])
         except Exception as ex:
@@ -421,16 +450,15 @@ def choose_clip(state):
         pool.append((v, cands, bool(heat)))
         log(f"[prepared] {v['title'][:50]} -> {len(cands)} candidate clips")
     if not pool:
-        log("No usable videos this cycle. Skipping.")
-        return None
+        log(f"No usable new videos in the last {days} day(s).")
+        return []
 
-    # Phase 2: ask Gemini about only the best few videos, with long pauses between calls.
+    # Ask Gemini about only the best few videos, with long pauses between calls.
     pool.sort(key=lambda p: max(c["score"] for c in p[1]), reverse=True)
-    global GEM_DEADLINE
-    GEM_DEADLINE = time.time() + CFG.get("gemini_budget_minutes", 10) * 60
     n_rate = CFG.get("videos_to_rate", 2)
     pause = CFG.get("gemini_pause_seconds", 25)
-    best = None
+    GEM_DEADLINE = time.time() + CFG.get("gemini_budget_minutes", 7) * 60
+    rated = []
     for n, (v, cands, has_heat) in enumerate(pool[:n_rate]):
         if n:
             time.sleep(pause)
@@ -442,12 +470,73 @@ def choose_clip(state):
         top = max(top3, key=lambda c: c["score"])
         log(f"[scored] {v['title'][:50]} -> best {top['score']:.0f} "
             f"({top['s']:.0f}-{top['e']:.0f}s, heat={top['heat']:.2f}, pace={top['pace']:.0f})")
-        if best is None or top["score"] > best["score"]:
-            best = top
-    if best and best["score"] >= CFG["min_score"]:
-        return best
-    log(f"No clip reached the minimum score of {CFG['min_score']}. Skipping this cycle.")
-    return None
+        rated.extend(top3)
+    ranked = sorted([c for c in rated if c["score"] >= CFG["min_score"]],
+                    key=lambda c: c["score"], reverse=True)
+    if not ranked:
+        log(f"No clip from the last {days} day(s) reached the minimum score of {CFG['min_score']}.")
+    return ranked
+
+
+def choose_clip(state):
+    """Tries the newest videos first (last 24h), then wider windows if nothing good is found."""
+    steps = CFG.get("days_back_steps") or [1, 3]
+    seen = set()
+    for days in steps:
+        log(f"[search] most viewed '{CFG['topic']}' videos from the last {days} day(s)")
+        ranked = _choose_in_window(state, days, seen)
+        if ranked:
+            return ranked
+    log("Nothing good enough this cycle. Skipping.")
+    return []
+
+
+# ============================ picture check (is it really gameplay?) ============================
+def grab_frames(src):
+    import base64
+    dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                "-of", "csv=p=0", str(src)], capture_output=True, text=True,
+                               check=True).stdout.strip() or 0)
+    frames = []
+    for i, f in enumerate((0.2, 0.5, 0.8)):
+        out = WORK / f"frame{i}.jpg"
+        out.unlink(missing_ok=True)
+        run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{dur * f:.2f}", "-i", str(src),
+             "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "5", str(out)])
+        if out.exists():
+            frames.append(base64.b64encode(out.read_bytes()).decode())
+    return frames
+
+
+def check_visuals(src, clip):
+    """Returns (True|False|None, reason). True = real in-game footage, None = could not check."""
+    global GEM_DEADLINE
+    try:
+        frames = grab_frames(src)
+    except Exception as ex:
+        return None, f"could not read frames: {str(ex)[:100]}"
+    if not frames:
+        return None, "no frames could be extracted"
+    GEM_DEADLINE = time.time() + 5 * 60
+    prompt = (
+        "These " + str(len(frames)) + " frames come from one clip of a YouTube video titled '" +
+        clip["video"]["title"] + "'. Decide whether the clip shows ACTUAL IN-GAME VIDEO-GAME FOOTAGE: "
+        "rendered game graphics, a game HUD or game camera, a character being controlled. Answer false if "
+        "it shows real-world camera footage (real people, streets, shops, restaurants, a real city), a "
+        "face-cam or talking head filling most of the screen, a news screen, a slideshow or a thumbnail-style "
+        'graphic. Return ONLY JSON: {"in_game": true or false, "confidence": 0-10, "reason": "one short sentence"}')
+    parts = [{"text": prompt}] + [{"inline_data": {"mime_type": "image/jpeg", "data": b}} for b in frames]
+    body = {"contents": [{"parts": parts}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1}}
+    data = _ask(body)
+    if not data:
+        return None, "Gemini could not look at the pictures"
+    d = data[0]
+    try:
+        ok = bool(d.get("in_game")) and float(d.get("confidence", 0)) >= 7
+    except (TypeError, ValueError):
+        ok = False
+    return ok, str(d.get("reason", ""))[:200]
 
 
 # ============================ 3. build the reel ============================
@@ -559,12 +648,38 @@ def post_reel(path, title, desc):
 # ============================ entry points ============================
 def run_once(dry):
     state = load_state()
-    clip = choose_clip(state)
-    if not clip:
+    ranked = choose_clip(state)
+    if not ranked:
         return
+    chosen, src, attempts = None, None, 0
+    for clip in ranked:
+        v = clip["video"]
+        if v["id"] in state.get("__rejected__", []):
+            continue
+        if attempts >= 3:
+            break
+        attempts += 1
+        log(f"[trying] {v['title']} | {clip['s']:.1f}-{clip['e']:.1f}s | score {clip['score']:.0f}")
+        src = download_section(v["id"], clip["s"], clip["e"], WORK / "source.mp4")
+        if CFG.get("check_visuals", True):
+            verdict, why = check_visuals(src, clip)
+            if verdict is None:
+                log(f"[skip] could not verify the pictures ({why}). Skipping this cycle instead of risking a wrong clip.")
+                return
+            if not verdict:
+                log(f"[rejected] not in-game footage: {why}")
+                state.setdefault("__rejected__", []).append(v["id"])
+                save_state(state)
+                continue
+            log(f"[visual ok] {why}")
+        chosen = clip
+        break
+    if not chosen:
+        log("No clip passed the picture check. Skipping this cycle.")
+        return
+    clip = chosen
     v = clip["video"]
     log(f"[chosen] {v['title']} | {clip['s']:.1f}-{clip['e']:.1f}s | score {clip['score']:.0f}")
-    src = download_section(v["id"], clip["s"], clip["e"], WORK / "source.mp4")
     words, spoken = transcribe(src)
     if spoken != CFG["language"]:
         log(f"[skip] clip is spoken in '{spoken}', not '{CFG['language']}'. Skipping this cycle.")
