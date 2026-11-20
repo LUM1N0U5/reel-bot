@@ -67,7 +67,8 @@ def find_videos():
     d = requests.get("https://www.googleapis.com/youtube/v3/videos", timeout=30,
                      params=dict(part="snippet", id=",".join(ids), key=YT_API_KEY)).json()
     meta = {v["id"]: v["snippet"] for v in d.get("items", [])}
-    return [dict(id=i, title=meta[i]["title"], channel=meta[i]["channelTitle"])
+    return [dict(id=i, title=meta[i]["title"], channel=meta[i]["channelTitle"],
+                 cat=str(meta[i].get("categoryId", "")), desc=(meta[i].get("description") or "")[:300])
             for i in ids if i in meta]
 
 
@@ -238,12 +239,16 @@ def llm_score(video, cands):
     prompt = (
         "You are a short-form video editor judging which excerpt of a YouTube video would perform "
         "best as a Facebook/Instagram Reel. Each candidate is a 30-60 second transcript (auto-captions, "
-        "no punctuation). Video title: " + video["title"] + "\n"
+        "no punctuation). Video title: " + video["title"] + ". Channel: " + video.get("channel", "") +
+        ". Description start: " + video.get("desc", "").replace("\n", " ") + "\n"
+        "Also give 'gameplay' (0-10): how sure you are that this excerpt shows ACTUAL in-game video-game "
+        "footage being played (player actions, missions, driving, shooting inside the game). Give 0-3 if it "
+        "is real-world footage, news, a reaction, a trailer breakdown, an interview, or just talking.\n"
         "For each candidate give integer scores 0-10: hook (do the first 3 seconds grab attention), "
         "self_contained (makes sense without the rest of the video), payoff (clear punchline/insight/reveal), "
         "retention (keeps viewers watching to the end). Also write 'title' (max 80 chars, curiosity-driven, "
         "honest, no hashtags) and 'hashtags' (5 relevant hashtags starting with #).\n"
-        'Return ONLY a JSON array like [{"id":0,"hook":0,"self_contained":0,"payoff":0,"retention":0,'
+        'Return ONLY a JSON array like [{"id":0,"hook":0,"self_contained":0,"payoff":0,"retention":0,"gameplay":0,'
         '"title":"","hashtags":["#a"]}].\nCandidates: ' + json.dumps(items))
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3}}
@@ -313,6 +318,8 @@ def llm_score(video, cands):
 def final_score(c, llm, has_heat):
     heat, pace = c["heat"] * 100, c["pace"]
     if llm:
+        if CFG.get("require_gameplay") and llm.get("gameplay", 0) < 6:
+            return 30.0      # not real gameplay: never let it pass the threshold
         l = (0.35 * llm.get("hook", 0) + 0.25 * llm.get("self_contained", 0) +
              0.20 * llm.get("payoff", 0) + 0.20 * llm.get("retention", 0)) * 10
         return 0.45 * l + 0.35 * heat + 0.20 * pace if has_heat else 0.70 * l + 0.30 * pace
@@ -326,6 +333,10 @@ def choose_clip(state):
     for v in find_videos():
         if evaluated >= CFG["videos_to_evaluate"]:
             break
+        want_cat = str(CFG.get("only_category", "") or "")
+        if want_cat and v.get("cat") != want_cat:
+            log(f"[skip] {v['title'][:50]}: not in YouTube category {want_cat} (Gaming is 20)")
+            continue
         try:
             duration, heat, words = fetch_info(v["id"])
         except Exception as ex:
