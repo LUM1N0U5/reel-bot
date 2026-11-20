@@ -19,11 +19,11 @@ WORK = ROOT / "work"
 WORK.mkdir(exist_ok=True)
 STATE_FILE = ROOT / "used_segments.json"
 
-YT_API_KEY = os.environ.get("YT_API_KEY", "")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-FB_PAGE_ID = os.environ.get("FB_PAGE_ID", "")
-FB_TOKEN = os.environ.get("FB_PAGE_TOKEN", "")
-GRAPH = "https://graph.facebook.com/v21.0"
+YT_API_KEY = os.environ.get("YT_API_KEY", "").strip()
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+FB_PAGE_ID = os.environ.get("FB_PAGE_ID", "").strip()
+FB_TOKEN = os.environ.get("FB_PAGE_TOKEN", "").strip()
+GRAPH = "https://graph.facebook.com/" + CFG.get("fb_api_version", "v27.0")
 BUFFER = 3.0   # seconds of safety margin between used segments
 PAUSE = 0.8    # gap between word start times that counts as a phrase boundary
 
@@ -625,28 +625,62 @@ def make_caption(clip):
 
 
 # ============================ 4. post to Facebook ============================
-def post_reel(path, title, desc):
+def fb_fail(r, step):
+    """Stop with Facebook's real reason instead of a bare '400 Bad Request'."""
+    try:
+        e = r.json().get("error", {})
+    except ValueError:
+        e = {}
+    msg = e.get("message") or r.text[:300]
+    raise SystemExit(f"Facebook {step} failed (HTTP {r.status_code}, code {e.get('code')}, "
+                     f"subcode {e.get('error_subcode')}): {msg}")
+
+
+def fb_preflight():
+    """Quick check (seconds) that the Page ID and Page token work, before doing any heavy work."""
     for name, val in (("FB_PAGE_ID", FB_PAGE_ID), ("FB_PAGE_TOKEN", FB_TOKEN)):
         if not val:
-            raise SystemExit(f"{name} is not set")
+            raise SystemExit(f"{name} secret is empty or missing")
+    r = requests.get(f"{GRAPH}/me", params={"fields": "id,name", "access_token": FB_TOKEN}, timeout=30)
+    if not r.ok:
+        fb_fail(r, "token check")
+    me = r.json()
+    if me.get("id") != FB_PAGE_ID:
+        raise SystemExit(
+            f"Facebook token check: the token belongs to '{me.get('name')}' (id {me.get('id')}), but FB_PAGE_ID is "
+            f"{FB_PAGE_ID}. FB_PAGE_TOKEN must be the PAGE access token for that exact Page "
+            f"(the 'access_token' next to your Page in the me/accounts result), not the user token.")
+    log(f"[facebook] token OK for Page '{me.get('name')}' (api {CFG.get('fb_api_version', 'v27.0')})")
+
+
+def post_reel(path, title, desc):
     r = requests.post(f"{GRAPH}/{FB_PAGE_ID}/video_reels", timeout=60,
                       data=dict(upload_phase="start", access_token=FB_TOKEN))
-    r.raise_for_status()
+    if not r.ok:
+        fb_fail(r, "reel start")
     video_id, upload_url = r.json()["video_id"], r.json()["upload_url"]
     size = path.stat().st_size
     with open(path, "rb") as f:
         u = requests.post(upload_url, data=f, timeout=900, headers={
             "Authorization": f"OAuth {FB_TOKEN}", "offset": "0", "file_size": str(size)})
-    u.raise_for_status()
+    if not u.ok:
+        fb_fail(u, "video upload")
     fin = requests.post(f"{GRAPH}/{FB_PAGE_ID}/video_reels", timeout=120, data=dict(
         upload_phase="finish", video_id=video_id, video_state="PUBLISHED",
         title=title, description=desc, access_token=FB_TOKEN))
-    fin.raise_for_status()
+    if not fin.ok:
+        fb_fail(fin, "reel publish")
     return video_id, fin.json()
 
 
 # ============================ entry points ============================
 def run_once(dry):
+    try:
+        fb_preflight()
+    except SystemExit as ex:
+        if not dry:
+            raise
+        log(f"[facebook] WARNING (a real run would stop here): {ex}")
     state = load_state()
     ranked = choose_clip(state)
     if not ranked:
