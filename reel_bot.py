@@ -192,8 +192,9 @@ def make_candidates(words, heat, duration):
 MODEL_FALLBACKS = ["gemini-flash-latest"]
 _GOOD_MODEL = None
 _DISCOVERED = None
-_DEAD = set()      # models Google says are gone: never retry them
-_FAILS = 0         # videos where every model failed (then we stop hammering Google)
+_DEAD = {"gemini-2.5-flash", "gemini-2.5-flash-lite"}   # known retired for this key: never try them
+GEM_DEADLINE = None   # time.time() after which we stop asking Gemini this run
+_FAILS = 0         # set to 99 only when the key itself is rejected
 GEM_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
@@ -212,7 +213,7 @@ def discover_models():
             if ("flash" in n and "generateContent" in m.get("supportedGenerationMethods", [])
                     and not any(x in n for x in ("image", "tts", "live", "audio", "embedding", "robotics"))):
                 names.append(n)
-        names.sort(key=lambda n: ("lite" in n, "preview" in n or "exp" in n, n))
+        names.sort(key=lambda n: ("omni" in n or "latest" in n, "lite" in n, "preview" in n or "exp" in n, n))
         _DISCOVERED = names
         log("  [llm] models your key can use:", ", ".join(names[:8]) or "(none)")
     except Exception as ex:
@@ -227,13 +228,70 @@ def _retry_delay(text, default=40):
     return min(max(secs, 15), 70)
 
 
+def _budget_left():
+    return GEM_DEADLINE is None or time.time() < GEM_DEADLINE
+
+
+def _try_model(model, body):
+    """Try one model up to 3 times. Returns (status, data): ok | dead | fatal | busy."""
+    url = f"{GEM_BASE}/models/{model}:generateContent"
+    cur = json.loads(json.dumps(body))
+    cur["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}   # faster answers
+    waits = [10, 25]
+    for attempt in range(3):
+        if not _budget_left():
+            return "busy", None
+        try:
+            r = requests.post(url, params={"key": GEMINI_KEY}, json=cur, timeout=60)
+            if r.status_code == 400 and "thinkingConfig" in cur["generationConfig"]:
+                cur["generationConfig"].pop("thinkingConfig")   # this model dislikes the setting
+                r = requests.post(url, params={"key": GEMINI_KEY}, json=cur, timeout=60)
+            sc = r.status_code
+            if sc in (404, 400):
+                log(f"  [llm] model '{model}' rejected ({sc}): {r.text[:150].strip()}")
+                return "dead", None
+            if sc in (401, 403):
+                log(f"  [llm] key problem ({sc}): {r.text[:200].strip()}")
+                return "fatal", None
+            if sc == 429:
+                log(f"  [llm] '{model}' rate-limited (429): {' '.join(r.text.split())[:200]}")
+                if re.search(r"per ?day|PerDay", r.text, re.I):
+                    log(f"  [llm] daily free quota used up for '{model}' - moving on")
+                    return "dead", None
+                if attempt < 2:
+                    wait = _retry_delay(r.text)
+                    log(f"  [llm] waiting {wait:.0f}s for the per-minute limit to reset")
+                    time.sleep(wait)
+                    continue
+                return "busy", None
+            if sc in (500, 502, 503, 504):
+                log(f"  [llm] '{model}' busy ({sc}), attempt {attempt + 1}/3")
+                if attempt < 2:
+                    time.sleep(waits[attempt])
+                    continue
+                return "busy", None
+            r.raise_for_status()
+            txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            try:
+                data = json.loads(txt)
+            except ValueError:
+                log(f"  [llm] '{model}' sent unreadable JSON, attempt {attempt + 1}/3")
+                continue
+            if isinstance(data, dict):
+                data = [data]
+            return "ok", [d for d in data if isinstance(d, dict)]
+        except requests.exceptions.Timeout:
+            log(f"  [llm] '{model}' timed out, attempt {attempt + 1}/3")
+        except Exception as ex:
+            log(f"  [llm] '{model}' error: {str(ex)[:150]}")
+            return "busy", None
+    return "busy", None
+
+
 def llm_score(video, cands):
-    """One gentle Gemini call scoring up to 3 candidates. Returns list of dicts or None."""
+    """Gemini call scoring up to 3 candidates. Persistent: many models, retries, one cool-down round."""
     global _GOOD_MODEL, _FAILS
-    if not GEMINI_KEY:
-        return None
-    if _FAILS >= 2:
-        log("  [llm] Gemini failed twice already this run - not hammering it any more")
+    if not GEMINI_KEY or _FAILS >= 99 or not _budget_left():
         return None
     items = [{"id": i, "text": c["text"][:1200]} for i, c in enumerate(cands)]
     prompt = (
@@ -252,65 +310,32 @@ def llm_score(video, cands):
         '"title":"","hashtags":["#a"]}].\nCandidates: ' + json.dumps(items))
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3}}
-    if _GOOD_MODEL and _GOOD_MODEL not in _DEAD:
-        models = [_GOOD_MODEL]
-    else:
-        first = CFG.get("gemini_model")
+
+    for round_no in range(2):                      # round 2 happens after a cool-down
         models = []
-        for m in ([first] if first else []) + MODEL_FALLBACKS + discover_models():
+        first = CFG.get("gemini_model")
+        for m in [_GOOD_MODEL, first] + discover_models() + MODEL_FALLBACKS:
             if m and m not in models and m not in _DEAD:
                 models.append(m)
-        models = models[:3]          # each model has its own free quota, but don't try dozens
-    for model in models:
-        url = f"{GEM_BASE}/models/{model}:generateContent"
-        cur = json.loads(json.dumps(body))
-        cur["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}   # faster answers
-        for attempt in range(2):                                                # first try + ONE retry
-            try:
-                r = requests.post(url, params={"key": GEMINI_KEY}, json=cur, timeout=75)
-                if r.status_code == 400 and "thinkingConfig" in cur["generationConfig"]:
-                    cur["generationConfig"].pop("thinkingConfig")   # this model dislikes the setting
-                    r = requests.post(url, params={"key": GEMINI_KEY}, json=cur, timeout=75)
-                if r.status_code in (404, 400):
-                    log(f"  [llm] model '{model}' rejected ({r.status_code}): {r.text[:150].strip()}")
-                    _DEAD.add(model)
-                    break
-                if r.status_code in (401, 403):
-                    log(f"  [llm] key problem ({r.status_code}): {r.text[:200].strip()}")
-                    _FAILS = 99
-                    return None
-                if r.status_code == 429:
-                    snippet = " ".join(r.text.split())[:260]
-                    log(f"  [llm] '{model}' rate-limited (429): {snippet}")
-                    if re.search(r"per ?day|PerDay", r.text, re.I):
-                        log(f"  [llm] daily free quota used up for '{model}' - moving on")
-                        _DEAD.add(model)
-                        break
-                    if attempt == 0:
-                        wait = _retry_delay(r.text)
-                        log(f"  [llm] waiting {wait:.0f}s for the per-minute limit to reset")
-                        time.sleep(wait)
-                    continue
-                if r.status_code in (500, 502, 503, 504):
-                    log(f"  [llm] '{model}' busy ({r.status_code}), attempt {attempt + 1}/2")
-                    if attempt == 0:
-                        time.sleep(15)
-                    continue
-                r.raise_for_status()
-                txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-                data = json.loads(txt)
-                if isinstance(data, dict):
-                    data = [data]
-                _GOOD_MODEL = model
-                _FAILS = 0
-                log(f"  [llm] using model '{model}'")
-                return [d for d in data if isinstance(d, dict)]
-            except requests.exceptions.Timeout:
-                log(f"  [llm] '{model}' timed out, attempt {attempt + 1}/2")
-            except Exception as ex:
-                log(f"  [llm] '{model}' error: {str(ex)[:150]}")
+        models = models[:6]
+        if not models:
+            break
+        for model in models:
+            if not _budget_left():
                 break
-    _FAILS += 1
+            status, data = _try_model(model, body)
+            if status == "ok":
+                _GOOD_MODEL = model
+                log(f"  [llm] using model '{model}'")
+                return data
+            if status == "fatal":
+                _FAILS = 99
+                return None
+            if status == "dead":
+                _DEAD.add(model)
+        if round_no == 0 and _budget_left():
+            log("  [llm] every model was busy - cooling down 60s, then trying them all again")
+            time.sleep(60)
     log("  [llm] no Gemini model worked for this video")
     return None
 
@@ -364,6 +389,8 @@ def choose_clip(state):
 
     # Phase 2: ask Gemini about only the best few videos, with long pauses between calls.
     pool.sort(key=lambda p: max(c["score"] for c in p[1]), reverse=True)
+    global GEM_DEADLINE
+    GEM_DEADLINE = time.time() + CFG.get("gemini_budget_minutes", 10) * 60
     n_rate = CFG.get("videos_to_rate", 2)
     pause = CFG.get("gemini_pause_seconds", 25)
     best = None
