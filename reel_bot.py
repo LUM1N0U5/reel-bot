@@ -96,22 +96,54 @@ def parse_words(path):
     return words
 
 
+YT_NOTES = []        # warnings/errors yt-dlp printed for the current video
+BLOCK_HITS = 0       # consecutive videos that looked blocked by YouTube
+DIAG_SHOWN = 0
+
+
+class _YDLLog:
+    """Collects yt-dlp warnings so we can SHOW why captions are missing."""
+    def debug(self, m): pass
+    def info(self, m): pass
+    def warning(self, m): YT_NOTES.append(str(m))
+    def error(self, m): YT_NOTES.append(str(m))
+
+
 def fetch_info(vid):
     """Returns (duration, heatmap, words) using YouTube captions + 'most replayed' data."""
+    global BLOCK_HITS, DIAG_SHOWN
     from yt_dlp import YoutubeDL
     for f in WORK.glob(f"{vid}.*.json3"):
         f.unlink()
+    YT_NOTES.clear()
     opts = ydl_opts(skip_download=True, ignore_no_formats_error=True, writesubtitles=True, writeautomaticsub=True,
                     subtitleslangs=[CFG["language"]], subtitlesformat="json3",
-                    outtmpl={"default": str(WORK / "%(id)s.%(ext)s")})
+                    outtmpl={"default": str(WORK / "%(id)s.%(ext)s")}, logger=_YDLLog())
     with YoutubeDL(opts) as y:
         info = y.extract_info(f"https://www.youtube.com/watch?v={vid}", download=True)
     lang = (info.get("language") or "").lower()
     if lang and not lang.startswith(CFG["language"].lower()):
         log(f"  [lang] video language is '{lang}', not '{CFG['language']}' - skipping")
+        BLOCK_HITS = 0
         return info.get("duration") or 0, [], []
     files = list(WORK.glob(f"{vid}.*.json3"))
     words = parse_words(files[0]) if files else []
+    if words:
+        BLOCK_HITS = 0
+    else:
+        notes = " | ".join(" ".join(n.split())[:200] for n in YT_NOTES[:3]) or "no message at all"
+        blocked = any(x in n.lower() for n in YT_NOTES
+                      for x in ("not a bot", "sign in", "login required", "cookies", "confirm you"))
+        if blocked:
+            BLOCK_HITS += 1
+        if DIAG_SHOWN < 3:
+            DIAG_SHOWN += 1
+            tracks = len(info.get("subtitles") or {}) + len(info.get("automatic_captions") or {})
+            log(f"  [diag] formats={len(info.get('formats') or [])}, caption tracks={tracks}; yt-dlp said: {notes}")
+        if BLOCK_HITS >= 3:
+            raise SystemExit(
+                "STOPPED: YouTube is refusing the saved login (YT_COOKIES), so nothing can be read. "
+                "Export fresh cookies from the throwaway account and update the YT_COOKIES secret.")
     return info.get("duration") or 0, info.get("heatmap") or [], words
 
 
@@ -354,7 +386,7 @@ def final_score(c, llm, has_heat):
 
 def choose_clip(state):
     # Phase 1: read captions + build candidate clips for several videos. No Gemini yet (cheap).
-    pool, evaluated = [], 0
+    pool, evaluated, tried = [], 0, 0
     for v in find_videos():
         if evaluated >= CFG["videos_to_evaluate"]:
             break
@@ -362,6 +394,11 @@ def choose_clip(state):
         if want_cat and v.get("cat") != want_cat:
             log(f"[skip] {v['title'][:50]}: not in YouTube category {want_cat} (Gaming is 20)")
             continue
+        if tried >= 10:
+            break
+        if tried:
+            time.sleep(3)        # be gentle with YouTube
+        tried += 1
         try:
             duration, heat, words = fetch_info(v["id"])
         except Exception as ex:
