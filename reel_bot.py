@@ -614,14 +614,18 @@ def render_reel(src_name, with_subs):
 
 
 def make_caption(clip):
+    """Caption with title, optional plain-text credit and hashtags. Never contains a link."""
     v, llm = clip["video"], clip.get("llm") or {}
-    title = (llm.get("title") or v["title"])[:100]
+    strip_links = lambda t: re.sub(r"(https?://|www\.)\S+", "", t).strip()
+    title = strip_links(llm.get("title") or v["title"])[:100]
     topic_tag = "#" + re.sub(r"\W+", "", CFG["topic"].title())
     tags = [t for t in llm.get("hashtags", []) if isinstance(t, str) and t.startswith("#")]
     tags = list(dict.fromkeys(tags + [topic_tag] + CFG["extra_hashtags"]))[:9]
-    desc = (f"{title} 🔥\n\nFollow for more {CFG['topic']} content!\n"
-            f"🎥 Credit: {v['channel']} - https://youtu.be/{v['id']}\n\n{' '.join(tags)}")
-    return title, desc
+    lines = [f"{title} \U0001F525", "", f"Follow for more {CFG['topic']} content!"]
+    if CFG.get("show_credit", True):
+        lines.append(f"\U0001F3A5 Credit: {strip_links(v['channel'])}")
+    lines += ["", " ".join(tags)]
+    return title, "\n".join(lines)
 
 
 # ============================ 4. post to Facebook ============================
